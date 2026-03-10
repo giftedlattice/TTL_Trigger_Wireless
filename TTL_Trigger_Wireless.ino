@@ -1,10 +1,30 @@
 /*
-  ESP32 MIN132 v1 - GUI/UX V0 (NO WebSockets, NO SD)
-  - SoftAP + single-page web UI
-  - HTTP endpoints for actions
-  - Polling for status updates
-  - In-RAM event log + CSV download
-  - LED PWM ramp on TRIGGER (GPIO25)
+  ESP32 TTL Box - Browser Controlled Trial Logic
+  ------------------------------------------------
+  Browser UI over SoftAP:
+    - Start Session
+    - Arm / Disarm
+    - Start Trial
+    - End Trial
+    - Abort
+    - Download CSV log
+
+  Trial logic:
+    START TRIAL:
+      - records trialStartTime
+      - LED ON immediately
+      - mousePin HIGH briefly, then auto-off
+
+    END TRIAL:
+      - computes reaction time
+      - LED OFF
+      - mousePin LOW
+      - pulses fSyncPin + ttlPin4 + ttlPin6 HIGH together for 20 ms
+
+  Notes:
+    - Non-blocking LED auto-off
+    - Non-blocking mouse TTL auto-off
+    - No physical button required
 */
 
 #include <WiFi.h>
@@ -20,7 +40,26 @@ WebServer server(80);
 static int64_t nowUs() { return esp_timer_get_time(); }
 static uint32_t nowMs() { return (uint32_t)(nowUs() / 1000); }
 
-// ---------------- State (use int to avoid Arduino enum/prototype weirdness) ----------------
+// ---------------- Pin map ----------------
+// CHANGE THESE FOR YOUR BOARD
+//
+// IMPORTANT:
+// On many ESP32 boards, GPIO 6-11 are reserved for flash and should not be used.
+// Your original Arduino sketch used 11, 7, 6. Those are usually NOT safe on ESP32.
+//
+// Suggested safe example mapping:
+const int ledPin   = 25;   // LED output
+const int mousePin = 26;   // mouse TTL output
+const int fSyncPin = 27;   // camera sync output
+const int ttlPin4  = 32;   // TTL output
+const int ttlPin6  = 33;   // TTL output
+
+// ---------------- Timing ----------------
+const unsigned long ledOnDuration   = 6000; // ms
+const unsigned long mouseOnDuration = 20;   // ms
+const unsigned long recordPulseMs   = 20;   // ms
+
+// ---------------- State ----------------
 static const int ST_IDLE          = 0;
 static const int ST_SESSION_READY = 1;
 static const int ST_ARMED         = 2;
@@ -42,8 +81,22 @@ struct SessionMeta {
   String subject, project, dateStr, sessionId;
 };
 static SessionMeta meta;
+
 static uint32_t trial = 0;
 static int64_t lastEventUs = 0;
+
+// ---------------- Trial runtime ----------------
+static bool trialInProgress = false;
+static unsigned long trialStartTime = 0;
+static unsigned long lastReactionTime = 0;
+
+// LED auto-off
+static bool ledAutoOffArmed = false;
+static unsigned long ledOffAt = 0;
+
+// Mouse auto-off
+static bool mouseAutoOffArmed = false;
+static unsigned long mouseOffAt = 0;
 
 // ---------------- In-RAM log ----------------
 struct LogEvent {
@@ -52,7 +105,8 @@ struct LogEvent {
   String detail;
   uint32_t trial;
 };
-static const int LOG_CAP = 200;
+
+static const int LOG_CAP = 300;
 static LogEvent logBuf[LOG_CAP];
 static int logHead = 0;
 static int logCount = 0;
@@ -88,82 +142,95 @@ static String makeSessionId() {
   return sid;
 }
 
-// ---------------- LED PWM (compat across ESP32 core 2.x & 3.x) ----------------
-static const int LED_PWM_PIN = 25;
+// ---------------- Core trial functions ----------------
+static void mouseClick() {
+  digitalWrite(mousePin, LOW);
+  delay(30);
 
-// PWM parameters
-static const int PWM_FREQ_HZ = 10000;
-static const int PWM_BITS    = 12;
-static const int PWM_MAX     = (1 << PWM_BITS) - 1;
-
-// Ramp parameters
-static const uint32_t RAMP_UP_MS   = 300;
-static const uint32_t RAMP_DOWN_MS = 300;
-static const uint32_t STEP_MS      = 5;
-
-// We will try new API first (core 3.x), else fallback to old
-static bool pwmInited = false;
-
-// Forward declare wrappers
-static void pwmInit();
-static void pwmWriteDuty(uint16_t duty);
-
-static void pwmInit() {
-  if (pwmInited) return;
-
-  // --- ESP32 Arduino core 3.x style ---
-  // ledcAttach(pin, freq, resolution_bits)
-  // If your core doesn't have this symbol, compilation will fail,
-  // so we use a preprocessor trick: check if LEDC is available via ESP_ARDUINO_VERSION.
-  // If that macro isn't present, we still fall back to old API below.
-
-#if defined(ESP_ARDUINO_VERSION) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  // New API
-  ledcAttach(LED_PWM_PIN, PWM_FREQ_HZ, PWM_BITS);
-  pwmInited = true;
-#else
-  // Old API (core 2.x): ledcSetup + ledcAttachPin + ledcWrite(channel, duty)
-  const int ch = 0;
-  ledcSetup(ch, PWM_FREQ_HZ, PWM_BITS);
-  ledcAttachPin(LED_PWM_PIN, ch);
-  pwmInited = true;
-#endif
-
-  pwmWriteDuty(0);
+  digitalWrite(mousePin, HIGH);
+  delay(10);
+  digitalWrite(mousePin, LOW);
+  delay(10);
 }
 
-static void pwmWriteDuty(uint16_t duty) {
-  if (!pwmInited) pwmInit();
-  if (duty > PWM_MAX) duty = PWM_MAX;
+static void triggerRecording() {
+  // Set low first
+  digitalWrite(fSyncPin, LOW);
+  digitalWrite(ttlPin4, LOW);
+  digitalWrite(ttlPin6, LOW);
 
-#if defined(ESP_ARDUINO_VERSION) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  // New API: ledcWrite(pin, duty)
-  ledcWrite(LED_PWM_PIN, duty);
-#else
-  // Old API: ledcWrite(channel, duty)
-  const int ch = 0;
-  ledcWrite(ch, duty);
-#endif
+  // Pulse all high together
+  digitalWrite(fSyncPin, HIGH);
+  digitalWrite(ttlPin4, HIGH);
+  digitalWrite(ttlPin6, HIGH);
+
+  addLog("RECORD_PULSE_HIGH", "fSync+ttl4+ttl6");
+  Serial.println("F-Sync, TTL4, TTL6 HIGH");
+
+  delay(recordPulseMs);
+
+  // Return low
+  digitalWrite(fSyncPin, LOW);
+  digitalWrite(ttlPin4, LOW);
+  digitalWrite(ttlPin6, LOW);
+
+  addLog("RECORD_PULSE_LOW", "fSync+ttl4+ttl6");
+  Serial.println("F-Sync, TTL4, TTL6 LOW");
 }
 
-static void ledRampOnce() {
-  const uint32_t stepsUp = max<uint32_t>(1, RAMP_UP_MS / STEP_MS);
-  for (uint32_t i = 0; i <= stepsUp; i++) {
-    uint16_t duty = (uint16_t)((uint32_t)PWM_MAX * i / stepsUp);
-    pwmWriteDuty(duty);
-    delay(STEP_MS);
-  }
+static void startTrialLogic() {
+  Serial.println("Starting Trial");
 
-  const uint32_t stepsDown = max<uint32_t>(1, RAMP_DOWN_MS / STEP_MS);
-  for (uint32_t i = 0; i <= stepsDown; i++) {
-    uint16_t duty = (uint16_t)((uint32_t)PWM_MAX * (stepsDown - i) / stepsDown);
-    pwmWriteDuty(duty);
-    delay(STEP_MS);
-  }
-  pwmWriteDuty(0);
+  trialStartTime = millis();
+  trialInProgress = true;
+
+  // LED ON immediately
+  digitalWrite(ledPin, HIGH);
+  ledAutoOffArmed = true;
+  ledOffAt = trialStartTime + ledOnDuration;
+
+  // Mouse TTL HIGH briefly, then auto off
+  digitalWrite(mousePin, HIGH);
+  mouseAutoOffArmed = true;
+  mouseOffAt = trialStartTime + mouseOnDuration;
+
+  addLog("TRIAL_START", "LED_ON mousePin_HIGH");
+  addLog("LED_ON", "auto_off_armed");
+  addLog("MOUSE_HIGH", "trial_start_ttl");
+
+  Serial.print("Trial Start Time: ");
+  Serial.println(trialStartTime);
 }
 
-// ---------------- UI (single page) ----------------
+static void endTrialLogic() {
+  Serial.println("Ending Trial");
+
+  unsigned long trialEndTime = millis();
+  lastReactionTime = trialEndTime - trialStartTime;
+
+  // Turn LED off
+  digitalWrite(ledPin, LOW);
+  ledAutoOffArmed = false;
+
+  // Force mouse LOW
+  digitalWrite(mousePin, LOW);
+  mouseAutoOffArmed = false;
+
+  addLog("TRIAL_END", "reaction_ms=" + String(lastReactionTime));
+  addLog("LED_OFF", "trial_end");
+  addLog("MOUSE_LOW", "trial_end");
+
+  Serial.print("Reaction Time (ms): ");
+  Serial.println(lastReactionTime);
+
+  // Trigger recording pulse
+  triggerRecording();
+
+  trialInProgress = false;
+  trial++;
+}
+
+// ---------------- UI ----------------
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html>
@@ -174,7 +241,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     body{font-family:system-ui;margin:0;background:#fafafa;color:#111}
     header{padding:16px 18px;background:#111;color:#fff}
     header h1{font-size:18px;margin:0}
-    main{padding:18px;max-width:760px;margin:0 auto}
+    main{padding:18px;max-width:860px;margin:0 auto}
     .card{background:#fff;border:1px solid #e7e7e7;border-radius:18px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
     label{display:block;font-size:13px;color:#444;margin:10px 0 6px}
     input,button{width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:14px;border:1px solid #ddd;background:#fff}
@@ -182,6 +249,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     button{border:0;background:#111;color:#fff;cursor:pointer}
     button.secondary{background:#eaeaea;color:#111}
     button.danger{background:#b00020}
+    button.good{background:#0f8a3b}
+    button.warn{background:#b36b00}
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
     .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
     .pill{display:inline-block;padding:6px 10px;border-radius:999px;font-size:13px}
@@ -191,17 +260,24 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     .pRun{background:#ffe0e0}
     .muted{color:#666;font-size:13px}
     .big{font-size:18px;padding:16px;border-radius:18px}
-    .log{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;background:#0b0b0b;color:#d7ffd7;border-radius:14px;padding:12px;max-height:180px;overflow:auto}
+    .log{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;background:#0b0b0b;color:#d7ffd7;border-radius:14px;padding:12px;max-height:240px;overflow:auto}
+    .row{display:flex;gap:18px;flex-wrap:wrap}
+    .stat{min-width:140px}
+    .stat .k{font-size:12px;color:#666}
+    .stat .v{font-size:20px;font-weight:700}
   </style>
 </head>
 <body>
-<header><h1>TTL Box (Local)</h1></header>
+<header><h1>TTL Box (Local Browser Control)</h1></header>
 <main>
 
   <div class="card">
-    <div>
-      <span id="pill" class="pill pIdle">IDLE</span>
-      <div class="muted" id="subline">Connecting…</div>
+    <span id="pill" class="pill pIdle">IDLE</span>
+    <div class="muted" id="subline">Connecting…</div>
+    <div class="row" style="margin-top:12px;">
+      <div class="stat"><div class="k">Trial</div><div class="v" id="trialNum">0</div></div>
+      <div class="stat"><div class="k">Trial Active</div><div class="v" id="trialActive">NO</div></div>
+      <div class="stat"><div class="k">Last Reaction (ms)</div><div class="v" id="rtVal">0</div></div>
     </div>
   </div>
 
@@ -218,11 +294,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="big" onclick="startSession()">Start Session</button>
       <button class="big secondary" onclick="resetAll()">Reset</button>
     </div>
-    <div class="muted" style="margin-top:10px;">Starting a session locks metadata so trials stay consistent.</div>
   </div>
 
   <div class="card" id="runtimeCard" style="display:none;">
-    <h3 style="margin:0 0 10px 0;font-size:16px;">Run Controls</h3>
+    <h3 style="margin:0 0 10px 0;font-size:16px;">Session Controls</h3>
 
     <div class="grid">
       <button class="big" onclick="arm()">ARM</button>
@@ -230,12 +305,21 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
 
     <div id="armedControls" style="display:none;margin-top:12px;">
-      <div class="grid3">
-        <button class="big" onclick="trigger()">TRIGGER</button>
-        <button class="big secondary" onclick="nextTrial()">NEXT TRIAL</button>
-        <button class="big danger" onclick="abortRun()">ABORT</button>
+      <div class="grid">
+        <button class="big good" onclick="startTrial()">START TRIAL</button>
+        <button class="big warn" onclick="endTrial()">END TRIAL</button>
       </div>
-      <div class="muted" style="margin-top:10px;">TRIGGER runs LED ramp on GPIO25.</div>
+
+      <div class="grid3" style="margin-top:10px;">
+        <button class="secondary" onclick="manualRecordPulse()">Manual Record Pulse</button>
+        <button class="secondary" onclick="manualMouseClick()">Mouse Click</button>
+        <button class="danger" onclick="abortRun()">ABORT</button>
+      </div>
+
+      <div class="muted" style="margin-top:10px;">
+        Start Trial = LED on + mouse TTL.<br>
+        End Trial = compute reaction time + pulse F-Sync / TTL4 / TTL6.
+      </div>
     </div>
 
     <div class="grid" style="margin-top:12px;">
@@ -260,11 +344,17 @@ function setPill(st){
 
 function setUI(){
   if(!status) return;
+
   setPill(status.state);
+
   const sub=[];
   if(status.sessionId) sub.push("Session: "+status.sessionId);
   sub.push("Trial: "+status.trial);
   document.getElementById('subline').textContent=sub.join(" • ");
+
+  document.getElementById('trialNum').textContent = status.trial;
+  document.getElementById('trialActive').textContent = status.trialInProgress ? "YES" : "NO";
+  document.getElementById('rtVal').textContent = status.lastReactionTime;
 
   const locked=(status.state!=="IDLE");
   document.getElementById('subject').disabled=locked;
@@ -278,8 +368,16 @@ function setUI(){
 }
 
 async function post(path, data){
-  const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data||{})});
-  if(!res.ok){ console.log("ERR", await res.text()); }
+  const res = await fetch(path, {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(data||{})
+  });
+  if(!res.ok){
+    const txt = await res.text();
+    console.log("ERR", txt);
+    alert(txt);
+  }
   return res;
 }
 
@@ -298,9 +396,11 @@ async function startSession(){
 async function resetAll(){ await post("/api/reset",{}); await refreshStatus(); await refreshLogs(); }
 async function arm(){ await post("/api/arm",{}); await refreshStatus(); await refreshLogs(); }
 async function disarm(){ await post("/api/disarm",{}); await refreshStatus(); await refreshLogs(); }
-async function trigger(){ await post("/api/trigger",{}); await refreshStatus(); await refreshLogs(); }
-async function nextTrial(){ await post("/api/next",{}); await refreshStatus(); await refreshLogs(); }
+async function startTrial(){ await post("/api/trial/start",{}); await refreshStatus(); await refreshLogs(); }
+async function endTrial(){ await post("/api/trial/end",{}); await refreshStatus(); await refreshLogs(); }
 async function abortRun(){ await post("/api/abort",{}); await refreshStatus(); await refreshLogs(); }
+async function manualRecordPulse(){ await post("/api/manual/recordpulse",{}); await refreshStatus(); await refreshLogs(); }
+async function manualMouseClick(){ await post("/api/manual/mouseclick",{}); await refreshStatus(); await refreshLogs(); }
 
 function downloadCsv(){ window.location="/api/log.csv"; }
 
@@ -334,8 +434,11 @@ static String getJsonVal(const String& body, const char* key) {
   int j = i;
   while (j < (int)body.length()) {
     char c = body[j];
-    if (quoted) { if (c == '"') break; }
-    else { if (c == ',' || c == '}' || c == ' ') break; }
+    if (quoted) {
+      if (c == '"') break;
+    } else {
+      if (c == ',' || c == '}' || c == ' ') break;
+    }
     j++;
   }
   return body.substring(i, j);
@@ -348,14 +451,22 @@ static void sendStatus() {
   j += "\"sessionId\":\"" + esc(meta.sessionId) + "\",";
   j += "\"subject\":\"" + esc(meta.subject) + "\",";
   j += "\"project\":\"" + esc(meta.project) + "\",";
-  j += "\"dateStr\":\"" + esc(meta.dateStr) + "\"";
+  j += "\"dateStr\":\"" + esc(meta.dateStr) + "\",";
+  j += "\"trialInProgress\":" + String(trialInProgress ? "true" : "false") + ",";
+  j += "\"lastReactionTime\":" + String(lastReactionTime);
   j += "}";
   server.send(200, "application/json", j);
 }
 
 static void apiSessionStart() {
-  if (!server.hasArg("plain")) { server.send(400, "text/plain", "Missing body"); return; }
-  if (state != ST_IDLE) { server.send(409, "text/plain", "Session already active"); return; }
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Missing body");
+    return;
+  }
+  if (state != ST_IDLE) {
+    server.send(409, "text/plain", "Session already active");
+    return;
+  }
 
   String body = server.arg("plain");
   meta.subject = getJsonVal(body, "subject");
@@ -364,66 +475,132 @@ static void apiSessionStart() {
   meta.sessionId = makeSessionId();
 
   trial = 0;
+  lastReactionTime = 0;
+  trialInProgress = false;
   state = ST_SESSION_READY;
+
   addLog("SESSION_START", meta.sessionId);
   server.send(200, "text/plain", "OK");
 }
 
 static void apiReset() {
+  // Force outputs safe
+  digitalWrite(ledPin, LOW);
+  digitalWrite(mousePin, LOW);
+  digitalWrite(fSyncPin, LOW);
+  digitalWrite(ttlPin4, LOW);
+  digitalWrite(ttlPin6, LOW);
+
   meta = SessionMeta{};
   trial = 0;
-  logHead = 0; logCount = 0;
-  addLog("RESET", "");
+  lastReactionTime = 0;
+  trialInProgress = false;
+  ledAutoOffArmed = false;
+  mouseAutoOffArmed = false;
   state = ST_IDLE;
-  pwmWriteDuty(0);
+
+  logHead = 0;
+  logCount = 0;
+  addLog("RESET", "");
+
   server.send(200, "text/plain", "OK");
 }
 
 static void apiArm() {
-  if (state == ST_IDLE) { server.send(400, "text/plain", "Start session first"); return; }
-  if (state != ST_SESSION_READY) { server.send(409, "text/plain", "Invalid state"); return; }
+  if (state == ST_IDLE) {
+    server.send(400, "text/plain", "Start session first");
+    return;
+  }
+  if (state != ST_SESSION_READY) {
+    server.send(409, "text/plain", "Invalid state");
+    return;
+  }
   state = ST_ARMED;
   addLog("ARM", "");
   server.send(200, "text/plain", "OK");
 }
 
 static void apiDisarm() {
-  if (state != ST_ARMED && state != ST_RUNNING) { server.send(409, "text/plain", "Invalid state"); return; }
+  if (state != ST_ARMED && state != ST_RUNNING) {
+    server.send(409, "text/plain", "Invalid state");
+    return;
+  }
+  if (trialInProgress) {
+    server.send(409, "text/plain", "Cannot disarm while trial is active");
+    return;
+  }
   state = ST_SESSION_READY;
   addLog("DISARM", "");
-  pwmWriteDuty(0);
   server.send(200, "text/plain", "OK");
 }
 
-static void apiTrigger() {
-  if (state != ST_ARMED) { server.send(409, "text/plain", "Not armed"); return; }
+static void apiTrialStart() {
+  if (state != ST_ARMED) {
+    server.send(409, "text/plain", "System not armed");
+    return;
+  }
+  if (trialInProgress) {
+    server.send(409, "text/plain", "Trial already in progress");
+    return;
+  }
 
   state = ST_RUNNING;
-  addLog("TRIGGER", "manual_gui");
-  addLog("RAMP_START", "GPIO25 PWM");
-
-  ledRampOnce();
-
-  addLog("RAMP_END", "");
-  addLog("RUN_COMPLETE", "");
-  trial++;
-  state = ST_ARMED;
-
+  startTrialLogic();
   server.send(200, "text/plain", "OK");
 }
 
-static void apiNext() {
-  if (state == ST_IDLE) { server.send(409, "text/plain", "No session"); return; }
-  trial++;
-  addLog("NEXT_TRIAL", "");
+static void apiTrialEnd() {
+  if (state != ST_RUNNING) {
+    server.send(409, "text/plain", "No running trial");
+    return;
+  }
+  if (!trialInProgress) {
+    server.send(409, "text/plain", "Trial not in progress");
+    return;
+  }
+
+  endTrialLogic();
+  state = ST_ARMED;  // ready for next browser-triggered trial
   server.send(200, "text/plain", "OK");
 }
 
 static void apiAbort() {
-  if (state == ST_IDLE) { server.send(409, "text/plain", "No session"); return; }
+  if (state == ST_IDLE) {
+    server.send(409, "text/plain", "No session");
+    return;
+  }
+
+  digitalWrite(ledPin, LOW);
+  digitalWrite(mousePin, LOW);
+  digitalWrite(fSyncPin, LOW);
+  digitalWrite(ttlPin4, LOW);
+  digitalWrite(ttlPin6, LOW);
+
+  ledAutoOffArmed = false;
+  mouseAutoOffArmed = false;
+  trialInProgress = false;
   state = ST_SESSION_READY;
-  addLog("ABORT", "");
-  pwmWriteDuty(0);
+
+  addLog("ABORT", "all_outputs_low");
+  server.send(200, "text/plain", "OK");
+}
+
+static void apiManualRecordPulse() {
+  if (state == ST_IDLE) {
+    server.send(409, "text/plain", "No session");
+    return;
+  }
+  triggerRecording();
+  server.send(200, "text/plain", "OK");
+}
+
+static void apiManualMouseClick() {
+  if (state == ST_IDLE) {
+    server.send(409, "text/plain", "No session");
+    return;
+  }
+  addLog("MOUSE_CLICK", "manual");
+  mouseClick();
   server.send(200, "text/plain", "OK");
 }
 
@@ -442,7 +619,7 @@ static void handleLogCsv() {
 
 static void handleLogTail() {
   String out;
-  int show = min(30, logCount);
+  int show = min(40, logCount);
   int start = (logHead - show + LOG_CAP) % LOG_CAP;
   for (int i = 0; i < show; i++) {
     int idx = (start + i) % LOG_CAP;
@@ -454,25 +631,49 @@ static void handleLogTail() {
   server.send(200, "text/plain", out);
 }
 
-static void handleRoot() { server.send(200, "text/html", INDEX_HTML); }
+static void handleRoot() {
+  server.send(200, "text/html", INDEX_HTML);
+}
+
 static void handleRedirectAny() {
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
   server.send(302, "text/plain", "Redirecting");
 }
 
-// ---------------- Setup/Loop ----------------
+// ---------------- Setup / loop ----------------
 void setup() {
   Serial.begin(115200);
   delay(150);
 
-  pwmInit(); // setup PWM on GPIO25
+  // Pin configuration
+  pinMode(ledPin, OUTPUT);
+  pinMode(mousePin, OUTPUT);
+  pinMode(fSyncPin, OUTPUT);
+  pinMode(ttlPin4, OUTPUT);
+  pinMode(ttlPin6, OUTPUT);
 
+  digitalWrite(ledPin, LOW);
+  digitalWrite(mousePin, LOW);
+  digitalWrite(fSyncPin, LOW);
+  digitalWrite(ttlPin4, LOW);
+  digitalWrite(ttlPin6, LOW);
+
+  // Wi-Fi AP
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  IPAddress ip = WiFi.softAPIP();
-  Serial.print("AP SSID: "); Serial.println(AP_SSID);
-  Serial.print("AP IP:   "); Serial.println(ip);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 8);  // allow 8 clients
 
+  IPAddress ip = WiFi.softAPIP();
+
+  Serial.print("AP SSID: ");
+  Serial.println(AP_SSID);
+
+  Serial.print("AP IP: ");
+  Serial.println(ip);
+
+  Serial.print("Max clients: ");
+  Serial.println(WiFi.softAPgetStationNum());
+
+  // Routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, sendStatus);
 
@@ -480,9 +681,13 @@ void setup() {
   server.on("/api/reset", HTTP_POST, apiReset);
   server.on("/api/arm", HTTP_POST, apiArm);
   server.on("/api/disarm", HTTP_POST, apiDisarm);
-  server.on("/api/trigger", HTTP_POST, apiTrigger);
-  server.on("/api/next", HTTP_POST, apiNext);
+
+  server.on("/api/trial/start", HTTP_POST, apiTrialStart);
+  server.on("/api/trial/end", HTTP_POST, apiTrialEnd);
   server.on("/api/abort", HTTP_POST, apiAbort);
+
+  server.on("/api/manual/recordpulse", HTTP_POST, apiManualRecordPulse);
+  server.on("/api/manual/mouseclick", HTTP_POST, apiManualMouseClick);
 
   server.on("/api/log.csv", HTTP_GET, handleLogCsv);
   server.on("/api/log.tail", HTTP_GET, handleLogTail);
@@ -495,4 +700,22 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  unsigned long now = millis();
+
+  // Non-blocking LED auto-off
+  if (ledAutoOffArmed && now >= ledOffAt) {
+    digitalWrite(ledPin, LOW);
+    ledAutoOffArmed = false;
+    addLog("LED_AUTO_OFF", "timeout");
+    Serial.println("LED Auto-Off elapsed");
+  }
+
+  // Non-blocking mouse auto-off
+  if (mouseAutoOffArmed && now >= mouseOffAt) {
+    digitalWrite(mousePin, LOW);
+    mouseAutoOffArmed = false;
+    addLog("MOUSE_AUTO_OFF", "timeout");
+    Serial.println("MousePin Auto-Off elapsed");
+  }
 }
