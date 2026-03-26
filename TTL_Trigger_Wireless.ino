@@ -52,7 +52,7 @@ const int ledPin   = 25;   // LED output
 const int mousePin = 26;   // mouse TTL output
 const int fSyncPin = 27;   // camera sync output
 const int ttlPin4  = 32;   // TTL output
-const int ttlPin6  = 33;   // TTL output
+const int ttlPin6  = 33;   // Mic output
 
 // ---------------- Timing ----------------
 const unsigned long ledOnDuration   = 6000; // ms
@@ -157,12 +157,12 @@ static void triggerRecording() {
   // Set low first
   digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(ttlPin6, HIGH);
 
   // Pulse all high together
   digitalWrite(fSyncPin, HIGH);
   digitalWrite(ttlPin4, HIGH);
-  digitalWrite(ttlPin6, HIGH);
+  digitalWrite(ttlPin6, LOW);
 
   addLog("RECORD_PULSE_HIGH", "fSync+ttl4+ttl6");
   Serial.println("F-Sync, TTL4, TTL6 HIGH");
@@ -172,7 +172,7 @@ static void triggerRecording() {
   // Return low
   digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(ttlPin6, HIGH);
 
   addLog("RECORD_PULSE_LOW", "fSync+ttl4+ttl6");
   Serial.println("F-Sync, TTL4, TTL6 LOW");
@@ -489,7 +489,7 @@ static void apiReset() {
   digitalWrite(mousePin, LOW);
   digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(ttlPin6, HIGH);
 
   meta = SessionMeta{};
   trial = 0;
@@ -574,7 +574,7 @@ static void apiAbort() {
   digitalWrite(mousePin, LOW);
   digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(ttlPin6, HIGH);
 
   ledAutoOffArmed = false;
   mouseAutoOffArmed = false;
@@ -656,7 +656,7 @@ void setup() {
   digitalWrite(mousePin, LOW);
   digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(ttlPin6, HIGH);
 
   // Wi-Fi AP
   WiFi.mode(WIFI_AP);
