@@ -19,9 +19,15 @@
       - computes reaction time
       - LED OFF
       - mousePin LOW
-      - pulses fSyncPin + ttlPin4 + ttlPin6 HIGH together for 20 ms
+      - pulses:
+          fSyncPin ACTIVE-LOW for Avisoft
+          ttlPin4 ACTIVE-HIGH
+          ttlPin6 ACTIVE-HIGH
 
   Notes:
+    - Avisoft DIN is assumed low-active:
+        idle = HIGH
+        trigger = LOW pulse
     - Non-blocking LED auto-off
     - Non-blocking mouse TTL auto-off
     - No physical button required
@@ -45,14 +51,13 @@ static uint32_t nowMs() { return (uint32_t)(nowUs() / 1000); }
 //
 // IMPORTANT:
 // On many ESP32 boards, GPIO 6-11 are reserved for flash and should not be used.
-// Your original Arduino sketch used 11, 7, 6. Those are usually NOT safe on ESP32.
 //
 // Suggested safe example mapping:
 const int ledPin   = 25;   // LED output
 const int mousePin = 26;   // mouse TTL output
-const int fSyncPin = 27;   // camera sync output
-const int ttlPin4  = 32;   // TTL output
-const int ttlPin6  = 33;   // TTL output
+const int fSyncPin = 27;   // Avisoft trigger output (ACTIVE-LOW)
+const int ttlPin4  = 32;   // TTL output (ACTIVE-HIGH)
+const int ttlPin6  = 33;   // TTL output (ACTIVE-HIGH)
 
 // ---------------- Timing ----------------
 const unsigned long ledOnDuration   = 6000; // ms
@@ -154,28 +159,36 @@ static void mouseClick() {
 }
 
 static void triggerRecording() {
-  // Set low first
-  digitalWrite(fSyncPin, LOW);
+  // Avisoft DIN assumed ACTIVE-LOW:
+  //   idle = HIGH
+  //   trigger = LOW pulse
+  //
+  // ttlPin4 and ttlPin6 remain ACTIVE-HIGH
+
+  // Set idle states first
+  digitalWrite(fSyncPin, HIGH);   // Avisoft idle
   digitalWrite(ttlPin4, LOW);
   digitalWrite(ttlPin6, LOW);
 
-  // Pulse all high together
-  digitalWrite(fSyncPin, HIGH);
-  digitalWrite(ttlPin4, HIGH);
-  digitalWrite(ttlPin6, HIGH);
+  delay(2); // optional settle time
 
-  addLog("RECORD_PULSE_HIGH", "fSync+ttl4+ttl6");
-  Serial.println("F-Sync, TTL4, TTL6 HIGH");
+  // Trigger pulse
+  digitalWrite(fSyncPin, LOW);    // ACTIVE-LOW trigger
+  digitalWrite(ttlPin4, HIGH);    // ACTIVE-HIGH pulse
+  digitalWrite(ttlPin6, HIGH);    // ACTIVE-HIGH pulse
+
+  addLog("RECORD_PULSE_ACTIVE", "fSync_LOW ttl4_HIGH ttl6_HIGH");
+  Serial.println("F-Sync LOW trigger, TTL4 HIGH, TTL6 HIGH");
 
   delay(recordPulseMs);
 
-  // Return low
-  digitalWrite(fSyncPin, LOW);
+  // Return to idle
+  digitalWrite(fSyncPin, HIGH);   // back to idle
   digitalWrite(ttlPin4, LOW);
   digitalWrite(ttlPin6, LOW);
 
-  addLog("RECORD_PULSE_LOW", "fSync+ttl4+ttl6");
-  Serial.println("F-Sync, TTL4, TTL6 LOW");
+  addLog("RECORD_PULSE_IDLE", "fSync_HIGH ttl4_LOW ttl6_LOW");
+  Serial.println("F-Sync HIGH idle, TTL4 LOW, TTL6 LOW");
 }
 
 static void startTrialLogic() {
@@ -487,7 +500,7 @@ static void apiReset() {
   // Force outputs safe
   digitalWrite(ledPin, LOW);
   digitalWrite(mousePin, LOW);
-  digitalWrite(fSyncPin, LOW);
+  digitalWrite(fSyncPin, HIGH);   // Avisoft idle state
   digitalWrite(ttlPin4, LOW);
   digitalWrite(ttlPin6, LOW);
 
@@ -560,7 +573,7 @@ static void apiTrialEnd() {
   }
 
   endTrialLogic();
-  state = ST_ARMED;  // ready for next browser-triggered trial
+  state = ST_ARMED;
   server.send(200, "text/plain", "OK");
 }
 
@@ -572,7 +585,7 @@ static void apiAbort() {
 
   digitalWrite(ledPin, LOW);
   digitalWrite(mousePin, LOW);
-  digitalWrite(fSyncPin, LOW);
+  digitalWrite(fSyncPin, HIGH);   // Avisoft idle state
   digitalWrite(ttlPin4, LOW);
   digitalWrite(ttlPin6, LOW);
 
@@ -581,7 +594,7 @@ static void apiAbort() {
   trialInProgress = false;
   state = ST_SESSION_READY;
 
-  addLog("ABORT", "all_outputs_low");
+  addLog("ABORT", "all_outputs_safe");
   server.send(200, "text/plain", "OK");
 }
 
@@ -652,15 +665,16 @@ void setup() {
   pinMode(ttlPin4, OUTPUT);
   pinMode(ttlPin6, OUTPUT);
 
+  // Safe startup states
   digitalWrite(ledPin, LOW);
   digitalWrite(mousePin, LOW);
-  digitalWrite(fSyncPin, LOW);
+  digitalWrite(fSyncPin, HIGH);   // Avisoft idle = HIGH
   digitalWrite(ttlPin4, LOW);
   digitalWrite(ttlPin6, LOW);
 
   // Wi-Fi AP
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 8);  // allow 8 clients
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 8);
 
   IPAddress ip = WiFi.softAPIP();
 
@@ -670,7 +684,7 @@ void setup() {
   Serial.print("AP IP: ");
   Serial.println(ip);
 
-  Serial.print("Max clients: ");
+  Serial.print("Connected clients now: ");
   Serial.println(WiFi.softAPgetStationNum());
 
   // Routes
