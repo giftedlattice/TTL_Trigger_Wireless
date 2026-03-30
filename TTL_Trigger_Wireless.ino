@@ -19,18 +19,16 @@
       - computes reaction time
       - LED OFF
       - mousePin LOW
-      - pulses:
-          fSyncPin ACTIVE-LOW for Avisoft
-          ttlPin4 ACTIVE-HIGH
-          ttlPin6 ACTIVE-HIGH
+      - pulses fSyncPin + ttlPin4 + avisoftPin HIGH together for 20 ms
 
   Notes:
-    - Avisoft DIN is assumed low-active:
-        idle = HIGH
-        trigger = LOW pulse
     - Non-blocking LED auto-off
     - Non-blocking mouse TTL auto-off
     - No physical button required
+
+  IMPORTANT HARDWARE NOTE:
+    avisoftPin should drive your transistor/opto input,
+    NOT connect directly to the Avisoft DIN line.
 */
 
 #include <WiFi.h>
@@ -47,17 +45,13 @@ static int64_t nowUs() { return esp_timer_get_time(); }
 static uint32_t nowMs() { return (uint32_t)(nowUs() / 1000); }
 
 // ---------------- Pin map ----------------
-// CHANGE THESE FOR YOUR BOARD
-//
 // IMPORTANT:
 // On many ESP32 boards, GPIO 6-11 are reserved for flash and should not be used.
-//
-// Suggested safe example mapping:
-const int ledPin   = 25;   // LED output
-const int mousePin = 26;   // mouse TTL output
-const int fSyncPin = 27;   // Avisoft trigger output (ACTIVE-LOW)
-const int ttlPin4  = 32;   // TTL output (ACTIVE-HIGH)
-const int ttlPin6  = 33;   // TTL output (ACTIVE-HIGH)
+const int ledPin      = 25;   // LED output
+const int mousePin    = 26;   // mouse TTL output
+const int fSyncPin    = 27;   // camera sync output
+const int ttlPin4     = 32;   // TTL output
+const int avisoftPin  = 33;   // Avisoft trigger output
 
 // ---------------- Timing ----------------
 const unsigned long ledOnDuration   = 6000; // ms
@@ -159,36 +153,28 @@ static void mouseClick() {
 }
 
 static void triggerRecording() {
-  // Avisoft DIN assumed ACTIVE-LOW:
-  //   idle = HIGH
-  //   trigger = LOW pulse
-  //
-  // ttlPin4 and ttlPin6 remain ACTIVE-HIGH
-
-  // Set idle states first
-  digitalWrite(fSyncPin, HIGH);   // Avisoft idle
+  // Set low first
+  digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(avisoftPin, LOW);
 
-  delay(2); // optional settle time
+  // Pulse all high together
+  digitalWrite(fSyncPin, HIGH);
+  digitalWrite(ttlPin4, HIGH);
+  digitalWrite(avisoftPin, HIGH);
 
-  // Trigger pulse
-  digitalWrite(fSyncPin, LOW);    // ACTIVE-LOW trigger
-  digitalWrite(ttlPin4, HIGH);    // ACTIVE-HIGH pulse
-  digitalWrite(ttlPin6, HIGH);    // ACTIVE-HIGH pulse
-
-  addLog("RECORD_PULSE_ACTIVE", "fSync_LOW ttl4_HIGH ttl6_HIGH");
-  Serial.println("F-Sync LOW trigger, TTL4 HIGH, TTL6 HIGH");
+  addLog("RECORD_PULSE_HIGH", "fSync+ttl4+avisoft");
+  Serial.println("F-Sync, TTL4, Avisoft HIGH");
 
   delay(recordPulseMs);
 
-  // Return to idle
-  digitalWrite(fSyncPin, HIGH);   // back to idle
+  // Return low
+  digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(avisoftPin, LOW);
 
-  addLog("RECORD_PULSE_IDLE", "fSync_HIGH ttl4_LOW ttl6_LOW");
-  Serial.println("F-Sync HIGH idle, TTL4 LOW, TTL6 LOW");
+  addLog("RECORD_PULSE_LOW", "fSync+ttl4+avisoft");
+  Serial.println("F-Sync, TTL4, Avisoft LOW");
 }
 
 static void startTrialLogic() {
@@ -331,7 +317,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 
       <div class="muted" style="margin-top:10px;">
         Start Trial = LED on + mouse TTL.<br>
-        End Trial = compute reaction time + pulse F-Sync / TTL4 / TTL6.
+        End Trial = compute reaction time + pulse F-Sync / TTL4 / Avisoft.
       </div>
     </div>
 
@@ -500,9 +486,9 @@ static void apiReset() {
   // Force outputs safe
   digitalWrite(ledPin, LOW);
   digitalWrite(mousePin, LOW);
-  digitalWrite(fSyncPin, HIGH);   // Avisoft idle state
+  digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(avisoftPin, LOW);
 
   meta = SessionMeta{};
   trial = 0;
@@ -585,16 +571,16 @@ static void apiAbort() {
 
   digitalWrite(ledPin, LOW);
   digitalWrite(mousePin, LOW);
-  digitalWrite(fSyncPin, HIGH);   // Avisoft idle state
+  digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(avisoftPin, LOW);
 
   ledAutoOffArmed = false;
   mouseAutoOffArmed = false;
   trialInProgress = false;
   state = ST_SESSION_READY;
 
-  addLog("ABORT", "all_outputs_safe");
+  addLog("ABORT", "all_outputs_low");
   server.send(200, "text/plain", "OK");
 }
 
@@ -663,14 +649,13 @@ void setup() {
   pinMode(mousePin, OUTPUT);
   pinMode(fSyncPin, OUTPUT);
   pinMode(ttlPin4, OUTPUT);
-  pinMode(ttlPin6, OUTPUT);
+  pinMode(avisoftPin, OUTPUT);
 
-  // Safe startup states
   digitalWrite(ledPin, LOW);
   digitalWrite(mousePin, LOW);
-  digitalWrite(fSyncPin, HIGH);   // Avisoft idle = HIGH
+  digitalWrite(fSyncPin, LOW);
   digitalWrite(ttlPin4, LOW);
-  digitalWrite(ttlPin6, LOW);
+  digitalWrite(avisoftPin, LOW);
 
   // Wi-Fi AP
   WiFi.mode(WIFI_AP);
@@ -684,7 +669,7 @@ void setup() {
   Serial.print("AP IP: ");
   Serial.println(ip);
 
-  Serial.print("Connected clients now: ");
+  Serial.print("Max clients: ");
   Serial.println(WiFi.softAPgetStationNum());
 
   // Routes
